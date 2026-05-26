@@ -25,8 +25,13 @@ import (
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	colfeaturegate "go.opentelemetry.io/collector/featuregate"
 	"go.uber.org/zap/zapcore"
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -217,6 +222,33 @@ func main() {
 		}
 	}
 
+	// Restrict the informer caches for operator-created resources to only objects
+	// labeled with managed-by=opentelemetry-operator. Without this filter, owning
+	// these GVKs causes a cluster-wide LIST+WATCH for every ConfigMap/Service/etc.
+	// in the cluster, which dominates startup memory.
+	//
+	// ServiceAccount, ClusterRole, and ClusterRoleBinding are deliberately NOT
+	// filtered: those follow an adoption pattern where users may pre-create the
+	// resource (with bindings) and the operator then attaches owner refs/labels.
+	// A label-filtered cache would hide the pre-created object, causing the
+	// CreateOrUpdate Get to NotFound and the subsequent Create to AlreadyExists.
+	operatorManagedSelector := labels.SelectorFromSet(labels.Set{
+		"app.kubernetes.io/managed-by": "opentelemetry-operator",
+	})
+	managedByByObject := cache.ByObject{Label: operatorManagedSelector}
+	byObject := map[client.Object]cache.ByObject{
+		&corev1.ConfigMap{}:                      managedByByObject,
+		&corev1.Service{}:                        managedByByObject,
+		&appsv1.Deployment{}:                     managedByByObject,
+		&appsv1.DaemonSet{}:                      managedByByObject,
+		&appsv1.StatefulSet{}:                    managedByByObject,
+		&networkingv1.Ingress{}:                  managedByByObject,
+		&networkingv1.NetworkPolicy{}:            managedByByObject,
+		&autoscalingv2.HorizontalPodAutoscaler{}: managedByByObject,
+		&policyv1.PodDisruptionBudget{}:          managedByByObject,
+		&gatewayv1.HTTPRoute{}:                   managedByByObject,
+	}
+
 	mgrOptions := ctrl.Options{
 		Scheme:                        scheme,
 		Metrics:                       metricsOptions,
@@ -234,6 +266,19 @@ func main() {
 		}),
 		Cache: cache.Options{
 			DefaultNamespaces: namespaces,
+			ByObject:          byObject,
+		},
+		// Secret and ReplicaSet are only read on-demand by the pod-mutating
+		// webhook (TLS validation, owner-chain walk). No controller Owns these,
+		// so route reads through the API server instead of standing up
+		// cluster-wide informers for them.
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{
+					&corev1.Secret{},
+					&appsv1.ReplicaSet{},
+				},
+			},
 		},
 	}
 
@@ -508,11 +553,12 @@ func main() {
 			os.Exit(1)
 		}
 		decoder := admission.NewDecoder(mgr.GetScheme())
+		apiReader := mgr.GetAPIReader()
 		mgr.GetWebhookServer().Register("/mutate-v1-pod", &webhook.Admission{
 			Handler: podmutation.NewWebhookHandler(cfg, ctrl.Log.WithName("pod-webhook"), decoder, mgr.GetClient(),
 				[]podmutation.PodMutator{
-					sidecar.NewMutator(logger, cfg, mgr.GetClient()),
-					instrumentation.NewMutator(logger, mgr.GetClient(), mgr.GetEventRecorder("opentelemetry-operator"), cfg),
+					sidecar.NewMutator(logger, cfg, mgr.GetClient(), apiReader),
+					instrumentation.NewMutator(logger, mgr.GetClient(), apiReader, mgr.GetEventRecorder("opentelemetry-operator"), cfg),
 				}),
 		})
 
